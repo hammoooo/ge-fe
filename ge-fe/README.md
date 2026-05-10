@@ -36,7 +36,7 @@ Menual은 고객이 단계별 고민지를 작성해 뷰티 전문가에게 전�
 
 ## 📆 프로젝트 기간
 
-- 개발 기간: `2025.03 - 2025.05`
+- 개발 기간: `2025.09 - 2026.02`
 
 ---
 
@@ -63,7 +63,7 @@ Menual은 고객이 단계별 고민지를 작성해 뷰티 전문가에게 전�
   env:
     API_TOKEN_GITHUB: ${{ secrets.AUTO_ACTIONS }}
   with:
-    source-directory: 'output'
+    source-directory: "output"
     destination-github-username: dragunshin
     destination-repository-name: ge-fe
     commit-message: ${{ github.event.commits[0].message }}
@@ -122,17 +122,17 @@ setMessages((prev) => {
 
 헤어 상담에 필요한 정보(사진 4종 + 얼굴형 + 원하는 이미지 + 질문)를 단계별로 수집합니다.
 
-| 단계 | 내용 |
-|---|---|
-| 1/7 | 평상시 헤어스타일 사진 업로드 |
-| 2/7 | 머리를 올린 정면 사진 업로드 |
-| 3/7 | 측면 사진 업로드 |
-| 4/7 | 원하는 이미지 사진 업로드 |
-| 5/7 | 얼굴형 선택 |
-| 6/7 | 원하는 헤어 스타일 선택 |
-| 7/7 | 추가 질문 작성 |
+| 단계 | 내용                          |
+| ---- | ----------------------------- |
+| 1/7  | 평상시 헤어스타일 사진 업로드 |
+| 2/7  | 머리를 올린 정면 사진 업로드  |
+| 3/7  | 측면 사진 업로드              |
+| 4/7  | 원하는 이미지 사진 업로드     |
+| 5/7  | 얼굴형 선택                   |
+| 6/7  | 원하는 헤어 스타일 선택       |
+| 7/7  | 추가 질문 작성                |
 
-- `?step=N&reservationId=X` 쿼리 파라미터로 단계 관리 → 새로고침·공유 URL에도 상태 유지
+- `?step=N&reservationId=X` 쿼리 파라미터로 단계 관리 → 새로고침, 공유 URL에도 상태 유지
 - `useLayoutEffect` + `requestAnimationFrame`으로 단계 전환마다 스크롤이 상단으로 이동
 - `useHairSetupStore` (Zustand)로 단계 간 사진 키(S3 경로) 보존
 - S3 Presigned URL로 사진을 직접 업로드 → 서버 부하 없이 대용량 이미지 처리
@@ -149,34 +149,80 @@ useLayoutEffect(() => {
 
 ---
 
-## 4. 전문가 시스템 (Expert System)
+## 4. S3 이미지 업로드 — AbortController 기반 안전한 프리뷰 관리
 
-### 포트폴리오 관리
+**문제 상황: 서버 오류 시 프리뷰가 남아 "업로드된 것처럼" 보이는 UX 오류**
 
-**페이지네이션 + 대표 지정 + 텍스트 더보기/접기를 갖춘 포트폴리오 관리 페이지**
+사진을 선택하면 로컬 `Object URL`로 프리뷰를 즉시 보여줍니다. 그런데 이후 S3 업로드가 실패하면, 프리뷰는 그대로 보이는 채 S3 키만 없는 상태가 됩니다. 사용자는 업로드가 된 줄 알고 다음 단계로 넘어가지만 실제로는 이미지가 저장되지 않은 문제가 발생했습니다.
 
-- `isFetchingRef`로 중복 API 호출 방지, 페이지 단위 무한 로드 (5개씩)
-- `requestAnimationFrame` 기반 `scrollHeight` 감지 → 텍스트가 실제로 잘렸을 때만 "더보기" 버튼 노출
-- 대표 포트폴리오 토글: 낙관적 업데이트로 응답 전 UI 즉시 반영, 서버 응답으로 최종 확정
-- 모달(삭제 확인 / 대표 지정 확인)은 배경 오버레이 클릭으로도 닫히도록 처리
+### 해결: 업로드 결과에 따른 프리뷰 생명주기 명확히 분리
+
+**단일 사진 업로드 (`SinglePhotoField`)**
+
+- 파일 선택 즉시 `URL.createObjectURL()`로 로컬 프리뷰를 표시하고 S3 업로드 시작
+- `AbortController`를 `abortRef`로 보관 → 유저가 X 버튼을 누르거나, 새 파일을 선택하거나, 컴포넌트가 언마운트될 때 `abort()` 호출로 진행 중인 presign-PUT 요청을 즉시 취소
+- `seqRef` (업로드 순서 카운터)로 새 업로드가 시작된 뒤 도착한 이전 응답을 무시 → 빠르게 사진을 바꿔도 stale 결과가 Zustand에 저장되지 않음
+- **S3 업로드 실패 시**: `URL.revokeObjectURL()`로 프리뷰를 즉시 제거 → 사용자가 업로드가 완료된 것으로 오인하는 상황 방지
+- presign 요청과 S3 PUT 요청 모두 동일한 `signal`을 전달해 중단 시 네트워크 요청이 두 단계 모두 취소됨
 
 ```typescript
-// 텍스트 오버플로우를 RAF 후에 감지해서 더보기 버튼 노출 여부 결정
-const raf = window.requestAnimationFrame(() => {
-  items.forEach((item) => {
-    const el = concernRefs.current[item.id];
-    const overflow = !!el && el.scrollHeight > el.clientHeight + 1;
-    next[item.id] = { concern: overflow, ... };
-  });
-  setShowMore(next);
-});
+const onChange = async (file: File) => {
+  handleRemove(); // 이전 업로드 abort + 프리뷰 초기화
+
+  const localUrl = URL.createObjectURL(file);
+  setPreviewUrl(localUrl); // 로컬 프리뷰 즉시 표시
+
+  const controller = new AbortController();
+  abortRef.current = controller;
+  const mySeq = ++seqRef.current;
+
+  try {
+    const { key } = await uploadImageViaPresign({
+      file,
+      resourceType,
+      resourceId,
+      imageType,
+      signal: controller.signal, // presign + PUT 모두 동일 signal 전달
+    });
+
+    if (seqRef.current !== mySeq) return; // 새 업로드가 시작됐으면 결과 무시
+    onUploadedKey(key); // 성공 시에만 Zustand에 S3 키 저장
+  } catch (e) {
+    if (controller.signal.aborted) return; // abort로 인한 에러는 무시
+    clearLocalPreview(); // 실패 시 프리뷰 제거 → 오해 방지
+  } finally {
+    if (seqRef.current === mySeq) setIsUploading(false);
+  }
+};
 ```
 
-### 상담 일정 설정
+**다중 사진 업로드 (`MultiPhotoPicker`)**
 
-- 상담 유형(메시지 / 화상) + 가격 정보를 불러와 카드 형태로 표시
-- 등록 여부에 따라 "빈 상태 → 등록 유도" / "목록 → 편집 버튼" 분기 렌더링
-- `useCallback` + `useEffect`로 refetch 함수 안정화, 오류 발생 시 재시도 버튼 제공
+- 생성한 모든 `Object URL`을 `objectUrlsRef`(Set)에 등록해 누락 없이 추적
+- 업로드 실패 시 해당 `Object URL`만 즉시 revoke + Set에서 제거 → 프리뷰 사라짐
+- 컴포넌트 언마운트 시 Set에 남은 모든 URL을 일괄 revoke → 메모리 누수 방지
+
+```typescript
+useEffect(() => {
+  return () => {
+    objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    objectUrlsRef.current.clear();
+  };
+}, []);
+
+const addFile = async (file: File) => {
+  const localUrl = URL.createObjectURL(file);
+  objectUrlsRef.current.add(localUrl);
+
+  try {
+    const { key } = await uploadImageViaPresign({ file, ... });
+    setPreviews((p) => [...p, { key, previewUrl: localUrl }]); // 성공 시에만 프리뷰 등록
+  } catch {
+    URL.revokeObjectURL(localUrl);
+    objectUrlsRef.current.delete(localUrl); // 실패 시 프리뷰 즉시 제거
+  }
+};
+```
 
 ---
 
@@ -195,45 +241,33 @@ const raf = window.requestAnimationFrame(() => {
 
 **일반 사용자 / 전문가 역할별로 분기되는 마이페이지**
 
-| 페이지 | 내용 |
-|---|---|
-| 마이페이지 메인 | 유저 타입 감지 후 일반 / 전문가 메뉴 분기 렌더링 |
-| 찜 목록 | 좋아요한 전문가 목록 조회 |
-| 포인트 내역 | 포인트 적립 / 사용 내역 |
-| 결제 내역 | 결제 내역 목록 |
-| 예약 내역 | 예약 상태별 목록 조회 |
-| 내 리뷰 | 작성한 리뷰 목록 조회 |
-| 리뷰 작성 | 상담 완료 건에 대한 별점 + 텍스트 리뷰 작성 |
-| 전문가 자기소개 | React Quill로 자기소개 편집 |
-| 전문가 포트폴리오 | 포트폴리오 목록 관리 (위 4번 참고) |
-| 전문가 일정 설정 | 상담 유형 / 가격 설정 (위 4번 참고) |
-| 전문가 상담 내역 | 진행한 상담 이력 조회 |
+| 페이지            | 내용                                             |
+| ----------------- | ------------------------------------------------ |
+| 마이페이지 메인   | 유저 타입 감지 후 일반 / 전문가 메뉴 분기 렌더링 |
+| 찜 목록           | 좋아요한 전문가 목록 조회                        |
+| 포인트 내역       | 포인트 적립 / 사용 내역                          |
+| 결제 내역         | 결제 내역 목록                                   |
+| 예약 내역         | 예약 상태별 목록 조회                            |
+| 내 리뷰           | 작성한 리뷰 목록 조회                            |
+| 리뷰 작성         | 상담 완료 건에 대한 별점 + 텍스트 리뷰 작성      |
+| 전문가 자기소개   | React Quill로 자기소개 편집                      |
+| 전문가 포트폴리오 | 포트폴리오 목록 관리 (위 4번 참고)               |
+| 전문가 일정 설정  | 상담 유형 / 가격 설정 (위 4번 참고)              |
+| 전문가 상담 내역  | 진행한 상담 이력 조회                            |
 
 ---
 
 ## 기술적 도전 & 해결
 
-| 문제 | 해결 방법 |
-|---|---|
-| 여러 컴포넌트에서 동시에 WebSocket을 마운트하면 중복 연결 발생 | 모듈 레벨 싱글톤 + 마운트 카운터로 연결 1개 유지 |
-| 재연결 후 구독이 사라져 메시지 미수신 | `onConnect`에서 활성 구독 목록을 flush해 자동 재구독 |
-| 소켓 콜백 내 `roomId`가 stale 클로저로 이전 값 참조 | `useRef`로 최신 값 동기화, `functional update`로 `prev` 사용 |
-| 서버 에코 메시지로 인한 메시지 중복 렌더링 | `messageId` 기반 중복 체크 |
-| 단계 전환 시 스크롤 위치가 이전 단계의 위치에 머무름 | `useLayoutEffect` + `requestAnimationFrame`으로 렌더 후 스크롤 탑 보장 |
-| 포트폴리오 텍스트가 잘렸는지 여부를 렌더 전에 알 수 없음 | RAF 후 `scrollHeight > clientHeight` 비교로 더보기 버튼 여부 결정 |
+| 문제                                                                 | 해결 방법                                                                                  |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 여러 컴포넌트에서 동시에 WebSocket을 마운트하면 중복 연결 발생       | 모듈 레벨 싱글톤 + 마운트 카운터로 연결 1개 유지                                           |
+| 재연결 후 구독이 사라져 메시지 미수신                                | `onConnect`에서 활성 구독 목록을 flush해 자동 재구독                                       |
+| 소켓 콜백 내 `roomId`가 stale 클로저로 이전 값 참조                  | `useRef`로 최신 값 동기화, `functional update`로 `prev` 사용                               |
+| 서버 에코 메시지로 인한 메시지 중복 렌더링                           | `messageId` 기반 중복 체크                                                                 |
+| 단계 전환 시 스크롤 위치가 이전 단계의 위치에 머무름                 | `useLayoutEffect` + `requestAnimationFrame`으로 렌더 후 스크롤 탑 보장                     |
+| S3 업로드 실패 시 프리뷰가 남아 업로드 완료로 오인                   | 업로드 실패 즉시 `URL.revokeObjectURL()`로 프리뷰 제거, S3 키는 성공 시에만 Zustand에 저장 |
+| 사진을 빠르게 교체하면 이전 업로드 결과가 늦게 도착해 잘못된 키 저장 | `seqRef` 카운터로 stale 응답 감지 후 무시, `AbortController`로 이전 요청 즉시 취소         |
+| 컴포넌트 언마운트 시 Object URL이 메모리에 누적                      | `objectUrlsRef`(Set)로 생성한 모든 URL 추적 → 언마운트 시 일괄 revoke                      |
 
 ---
-
-## 실행 방법
-
-```bash
-npm install
-npm run dev
-```
-
-### 환경 변수 (.env)
-
-```
-VITE_API_BASE_URL=https://api.menual.site/api
-VITE_WS_URL=https://api.menual.site/ws/chat
-```
